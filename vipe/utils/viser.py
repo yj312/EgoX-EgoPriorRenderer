@@ -57,6 +57,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def is_valid_extrinsic(w2c) -> bool:
+    if w2c is None:
+        return False
+    w2c = np.array(w2c)
+    if w2c.shape != (3, 4) and w2c.shape != (4, 4):
+        return False
+    if np.allclose(w2c, 0.0) or np.isnan(w2c).any():
+        return False
+    try:
+        det = np.abs(np.linalg.det(w2c[:3, :3]))
+        if det < 1e-4 or det > 1e4:
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def compute_robust_mean_tensors(stacked_depth: torch.Tensor, stacked_rgb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     GPU 벡터화된 버전: 픽셀별 NaN-aware 평균을 병렬로 계산.
@@ -81,6 +98,7 @@ class GlobalContext:
     mean_depth: torch.Tensor = None
     mean_rgb: torch.Tensor = None
     ego_manual: bool = False  # Manual ego camera control mode
+    frame_fix: bool = False   # Fix to 49 frames mode
     
     def __post_init__(self):
         # dataclass에서 None으로 초기화된 tensor 필드들 처리
@@ -322,6 +340,12 @@ class ClientClosures:
         self.manual_ego_frustum: viser.CameraFrustumHandle | None = None
         self.manual_ego_transform_handle: viser.TransformControlsHandle | None = None
         self.gui_manual_extrinsic_text: viser.GuiMarkdownHandle | None = None
+        
+        # Frame-by-frame annotation workflow states
+        self.modified_extrinsics = {}
+        self._auto_advancing = False
+        self._carry_over_position = None
+        self._carry_over_wxyz = None
 
     async def stop(self):
         self.task.cancel()
@@ -444,33 +468,352 @@ class ClientClosures:
         # Manual Ego Camera Control
         if self.global_context().ego_manual:
             with self.client.gui.add_folder("Manual Ego Camera"):
-                gui_show_manual_ego = self.client.gui.add_checkbox(
+                self.gui_show_manual_ego = self.client.gui.add_checkbox(
                     "Show Manual Camera",
                     initial_value=True,
                     hint="Show/hide manual ego camera frustum"
                 )
                 
                 gui_reset_manual_ego = self.client.gui.add_button(
-                    "Reset to Default Pose",
-                    hint="Reset manual camera to 90° CCW rotation"
+                    "Reset to Ego Pose",
+                    hint="Reset manual camera to the current frame's estimated ego camera pose"
                 )
                 
                 self.gui_manual_extrinsic_text = self.client.gui.add_markdown(
                     "**World to Manual Cam Extrinsic (4x3):**\n```\nInitializing...\n```"
                 )
                 
-                @gui_show_manual_ego.on_update
+                gui_confirm_frame = self.client.gui.add_button(
+                    "OK (Confirm Frame)",
+                    hint="Confirm current frame's manual camera pose and memory-save it, then auto-advance to next frame"
+                )
+
+                gui_save_all_frames = self.client.gui.add_button(
+                    "Save All to meta.json",
+                    hint="Save all confirmed frames from memory to meta.json"
+                )
+
+                gui_propagate_ego = self.client.gui.add_button(
+                    "Save & Propagate Alignment",
+                    hint="Propagate this aligned camera pose to all frames using current frame as reference"
+                )
+
+                gui_save_this_frame = self.client.gui.add_button(
+                    "Save This Frame Only",
+                    hint="Save this manual camera pose for only the current frame to meta.json"
+                )
+                
+                self.gui_status_text = self.client.gui.add_markdown("")
+                
+                @gui_confirm_frame.on_click
+                def _(_) -> None:
+                    try:
+                        current_frame = self.gui_timestep.value if self.gui_timestep is not None else 0
+                        if self.manual_ego_transform_handle is None:
+                            self.gui_status_text.content = "❌ **Error**: Manual camera handle not initialized."
+                            return
+                        position = self.manual_ego_transform_handle.position
+                        wxyz = self.manual_ego_transform_handle.wxyz
+                        rotation_matrix = tf.SO3(wxyz).as_matrix()
+                        c2w_user = np.eye(4, dtype=np.float32)
+                        c2w_user[:3, :3] = rotation_matrix
+                        c2w_user[:3, 3] = position
+                        w2c_user = np.linalg.inv(c2w_user)
+                        
+                        # W2C에 90도 Roll 오프셋 적용 (렌더러 규격에 맞춤)
+                        R_offset = np.eye(4, dtype=np.float32)
+                        R_offset[:3, :3] = np.array([
+                            [0.0, 1.0, 0.0],
+                            [-1.0, 0.0, 0.0],
+                            [0.0, 0.0, 1.0]
+                        ], dtype=np.float32)
+                        w2c_user = R_offset @ w2c_user
+                        
+                        # Memory save
+                        self.modified_extrinsics[current_frame] = w2c_user[:3, :].tolist()
+                        
+                        confirmed_count = len(self.modified_extrinsics)
+                        self.gui_status_text.content = f"ℹ️ **Memory**: Frame {current_frame} confirmed. (Total unsaved: {confirmed_count})"
+                        
+                        # Auto-advance to next frame
+                        next_frame = current_frame + 1
+                        if next_frame < len(self.scene_frame_handles):
+                            self._auto_advancing = True
+                            self._carry_over_position = position
+                            self._carry_over_wxyz = wxyz
+                            self.gui_timestep.value = next_frame
+                        else:
+                            self.gui_status_text.content = f"ℹ️ **Memory**: Frame {current_frame} confirmed. End of timeline. (Total unsaved: {confirmed_count})"
+                    except Exception as e:
+                        self.gui_status_text.content = f"❌ **Error**: {str(e)}"
+
+                @gui_save_all_frames.on_click
+                def _(_) -> None:
+                    try:
+                        if not self.modified_extrinsics:
+                            self.gui_status_text.content = "⚠️ **Warning**: No modifications in memory to save."
+                            return
+                            
+                        # Load meta.json
+                        current_artifact = self.global_context().artifacts[self.gui_id.value]
+                        dataset_name = current_artifact.base_path.name
+                        datasets_root = current_artifact.base_path.resolve().parents[1] / "datasets"
+                        meta_json_path = datasets_root / dataset_name / "meta.json"
+                        if not meta_json_path.exists():
+                            meta_json_path = Path(__file__).resolve().parents[3] / "datasets" / dataset_name / "meta.json"
+                            
+                        if not meta_json_path.exists():
+                            self.gui_status_text.content = f"❌ **Error**: meta.json not found at `{meta_json_path}`"
+                            return
+                            
+                        with open(meta_json_path, "r") as f:
+                            meta_data = json.load(f)
+                            
+                        if "test_datasets" not in meta_data or len(meta_data["test_datasets"]) == 0:
+                            self.gui_status_text.content = "❌ **Error**: Invalid meta.json format."
+                            return
+                            
+                        entry = meta_data["test_datasets"][0]
+                        if "ego_extrinsics" not in entry:
+                            self.gui_status_text.content = "❌ **Error**: 'ego_extrinsics' not found in meta.json."
+                            return
+                            
+                        ego_extrinsics = entry["ego_extrinsics"]
+                        
+                        # Overwrite entries
+                        for frame_idx, ext in self.modified_extrinsics.items():
+                            if frame_idx < len(ego_extrinsics):
+                                ego_extrinsics[frame_idx] = ext
+                                
+                        with open(meta_json_path, "w") as f:
+                            json.dump(meta_data, f, indent=4)
+                            
+                        self.gui_status_text.content = f"✅ **Success**: Saved {len(self.modified_extrinsics)} frames to meta.json!"
+                        self.modified_extrinsics.clear()
+                        
+                        # Rebuild scene to update green camera frustums
+                        self._rebuild_scene()
+                        
+                        # Keep manual camera controls
+                        if self.global_context().ego_manual:
+                            self._add_manual_ego_camera()
+                            
+                    except Exception as e:
+                        self.gui_status_text.content = f"❌ **Error**: {str(e)}"
+                
+                @self.gui_show_manual_ego.on_update
                 async def _(_) -> None:
+                    if self.gui_show_manual_ego.value:
+                        current_frame = self.gui_timestep.value if self.gui_timestep is not None else 0
+                        
+                        w2c_to_use = None
+                        if hasattr(self, 'modified_extrinsics') and current_frame in self.modified_extrinsics:
+                            w2c_to_use = self.modified_extrinsics[current_frame]
+                        elif hasattr(self, 'ego_extrinsics') and self.ego_extrinsics is not None and current_frame < len(self.ego_extrinsics):
+                            w2c_to_use = self.ego_extrinsics[current_frame]
+                            
+                        if is_valid_extrinsic(w2c_to_use):
+                            try:
+                                w2c_ego = np.array(w2c_to_use, dtype=np.float32)
+                                w2c_4x4 = np.eye(4, dtype=np.float32)
+                                w2c_4x4[:3, :] = w2c_ego
+                                
+                                # 90도 Roll 역변환 오프셋 적용 (Viser 화면에 똑바로 표시)
+                                R_offset_inv = np.eye(4, dtype=np.float32)
+                                R_offset_inv[:3, :3] = np.array([
+                                    [0.0, -1.0, 0.0],
+                                    [1.0, 0.0, 0.0],
+                                    [0.0, 0.0, 1.0]
+                                ], dtype=np.float32)
+                                w2c_4x4 = R_offset_inv @ w2c_4x4
+                                
+                                c2w_ego = np.linalg.inv(w2c_4x4)
+                                
+                                if self.manual_ego_transform_handle is not None:
+                                    self.manual_ego_transform_handle.position = c2w_ego[:3, 3]
+                                    self.manual_ego_transform_handle.wxyz = tf.SO3.from_matrix(c2w_ego[:3, :3]).wxyz
+                                    self._update_manual_ego_camera()
+                            except Exception as e:
+                                pass
+                                
                     if self.manual_ego_frame is not None:
-                        self.manual_ego_frame.visible = gui_show_manual_ego.value
+                        self.manual_ego_frame.visible = self.gui_show_manual_ego.value
                     if self.manual_ego_frustum is not None:
-                        self.manual_ego_frustum.visible = gui_show_manual_ego.value
+                        self.manual_ego_frustum.visible = self.gui_show_manual_ego.value
                     if self.manual_ego_transform_handle is not None:
-                        self.manual_ego_transform_handle.visible = gui_show_manual_ego.value
+                        self.manual_ego_transform_handle.visible = self.gui_show_manual_ego.value
                 
                 @gui_reset_manual_ego.on_click
                 def _(_) -> None:
                     self._reset_manual_ego_camera()
+
+                @gui_propagate_ego.on_click
+                def _(_) -> None:
+                    try:
+                        ref_frame = self.gui_timestep.value if self.gui_timestep is not None else 0
+                        
+                        # Get current manual camera transform
+                        if self.manual_ego_transform_handle is None:
+                            self.gui_status_text.content = "❌ **Error**: Manual camera handle not initialized."
+                            return
+                        position = self.manual_ego_transform_handle.position
+                        wxyz = self.manual_ego_transform_handle.wxyz
+                        rotation_matrix = tf.SO3(wxyz).as_matrix()
+                        c2w_user = np.eye(4, dtype=np.float32)
+                        c2w_user[:3, :3] = rotation_matrix
+                        c2w_user[:3, 3] = position
+                        w2c_user = np.linalg.inv(c2w_user)
+                        
+                        # W2C에 90도 Roll 오프셋 적용 (렌더러 규격에 맞춤)
+                        R_offset = np.eye(4, dtype=np.float32)
+                        R_offset[:3, :3] = np.array([
+                            [0.0, 1.0, 0.0],
+                            [-1.0, 0.0, 0.0],
+                            [0.0, 0.0, 1.0]
+                        ], dtype=np.float32)
+                        w2c_user = R_offset @ w2c_user
+                        
+                        # Load meta.json
+                        current_artifact = self.global_context().artifacts[self.gui_id.value]
+                        dataset_name = current_artifact.base_path.name
+                        
+                        # Try sibling datasets folder
+                        datasets_root = current_artifact.base_path.resolve().parents[1] / "datasets"
+                        meta_json_path = datasets_root / dataset_name / "meta.json"
+                        if not meta_json_path.exists():
+                            meta_json_path = Path(__file__).resolve().parents[3] / "datasets" / dataset_name / "meta.json"
+                            
+                        if not meta_json_path.exists():
+                            self.gui_status_text.content = f"❌ **Error**: meta.json not found at `{meta_json_path}`"
+                            return
+                            
+                        with open(meta_json_path, "r") as f:
+                            meta_data = json.load(f)
+                            
+                        if "test_datasets" not in meta_data or len(meta_data["test_datasets"]) == 0:
+                            self.gui_status_text.content = "❌ **Error**: Invalid meta.json format (no test_datasets)."
+                            return
+                            
+                        entry = meta_data["test_datasets"][0]
+                        if "ego_extrinsics" not in entry:
+                            self.gui_status_text.content = "❌ **Error**: 'ego_extrinsics' not found in meta.json. Run estimate_ego_extrinsics.py first."
+                            return
+                            
+                        ego_extrinsics = entry["ego_extrinsics"]
+                        if ref_frame >= len(ego_extrinsics):
+                            self.gui_status_text.content = f"❌ **Error**: Reference frame {ref_frame} exceeds available extrinsics ({len(ego_extrinsics)})."
+                            return
+                            
+                        # Compute offset matrix: W_offset_inv = W_user * W_raw_ref^-1
+                        w_raw_ref = np.eye(4, dtype=np.float32)
+                        w_raw_ref[:3, :] = np.array(ego_extrinsics[ref_frame])
+                        
+                        w_offset_inv = w2c_user @ np.linalg.inv(w_raw_ref)
+                        
+                        # Apply to all frames (or up to 49 if frame_fix is true)
+                        new_extrinsics = []
+                        limit = 49 if self.global_context().frame_fix else len(ego_extrinsics)
+                        for t in range(len(ego_extrinsics)):
+                            if t < limit:
+                                w_raw_t = np.eye(4, dtype=np.float32)
+                                w_raw_t[:3, :] = np.array(ego_extrinsics[t])
+                                w_cal_t = w_offset_inv @ w_raw_t
+                                new_extrinsics.append(w_cal_t[:3, :].tolist())
+                            else:
+                                new_extrinsics.append(ego_extrinsics[t])
+                            
+                        # Save back to meta.json
+                        entry["ego_extrinsics"] = new_extrinsics
+                        with open(meta_json_path, "w") as f:
+                            json.dump(meta_data, f, indent=4)
+                            
+                        self.gui_status_text.content = f"✅ **Success**: Propagated alignment (ref frame: {ref_frame}) and updated meta.json!"
+                        
+                        # Rebuild the scene to show the updated green frustums!
+                        self._rebuild_scene()
+                        
+                        # Re-add the manual camera controls so they stay visible and updated!
+                        if self.global_context().ego_manual:
+                            self._add_manual_ego_camera()
+                        
+                    except Exception as e:
+                        self.gui_status_text.content = f"❌ **Error**: {str(e)}"
+
+                @gui_save_this_frame.on_click
+                def _(_) -> None:
+                    try:
+                        current_frame = self.gui_timestep.value if self.gui_timestep is not None else 0
+                        
+                        # Get current manual camera transform
+                        if self.manual_ego_transform_handle is None:
+                            self.gui_status_text.content = "❌ **Error**: Manual camera handle not initialized."
+                            return
+                        position = self.manual_ego_transform_handle.position
+                        wxyz = self.manual_ego_transform_handle.wxyz
+                        rotation_matrix = tf.SO3(wxyz).as_matrix()
+                        c2w_user = np.eye(4, dtype=np.float32)
+                        c2w_user[:3, :3] = rotation_matrix
+                        c2w_user[:3, 3] = position
+                        w2c_user = np.linalg.inv(c2w_user)
+                        
+                        # W2C에 90도 Roll 오프셋 적용 (렌더러 규격에 맞춤)
+                        R_offset = np.eye(4, dtype=np.float32)
+                        R_offset[:3, :3] = np.array([
+                            [0.0, 1.0, 0.0],
+                            [-1.0, 0.0, 0.0],
+                            [0.0, 0.0, 1.0]
+                        ], dtype=np.float32)
+                        w2c_user = R_offset @ w2c_user
+                        
+                        # Load meta.json
+                        current_artifact = self.global_context().artifacts[self.gui_id.value]
+                        dataset_name = current_artifact.base_path.name
+                        
+                        # Try sibling datasets folder
+                        datasets_root = current_artifact.base_path.resolve().parents[1] / "datasets"
+                        meta_json_path = datasets_root / dataset_name / "meta.json"
+                        if not meta_json_path.exists():
+                            meta_json_path = Path(__file__).resolve().parents[3] / "datasets" / dataset_name / "meta.json"
+                            
+                        if not meta_json_path.exists():
+                            self.gui_status_text.content = f"❌ **Error**: meta.json not found at `{meta_json_path}`"
+                            return
+                            
+                        with open(meta_json_path, "r") as f:
+                            meta_data = json.load(f)
+                            
+                        if "test_datasets" not in meta_data or len(meta_data["test_datasets"]) == 0:
+                            self.gui_status_text.content = "❌ **Error**: Invalid meta.json format (no test_datasets)."
+                            return
+                            
+                        entry = meta_data["test_datasets"][0]
+                        if "ego_extrinsics" not in entry:
+                            self.gui_status_text.content = "❌ **Error**: 'ego_extrinsics' not found in meta.json. Run estimate_ego_extrinsics.py first."
+                            return
+                            
+                        ego_extrinsics = entry["ego_extrinsics"]
+                        if current_frame >= len(ego_extrinsics):
+                            self.gui_status_text.content = f"❌ **Error**: Current frame {current_frame} exceeds available extrinsics ({len(ego_extrinsics)})."
+                            return
+                            
+                        # Overwrite only the current frame
+                        ego_extrinsics[current_frame] = w2c_user[:3, :].tolist()
+                        
+                        # Save back to meta.json
+                        with open(meta_json_path, "w") as f:
+                            json.dump(meta_data, f, indent=4)
+                            
+                        self.gui_status_text.content = f"✅ **Success**: Saved pose for frame {current_frame} and updated meta.json!"
+                        
+                        # Rebuild the scene to show the updated green frustums!
+                        self._rebuild_scene()
+                        
+                        # Re-add the manual camera controls so they stay visible and updated!
+                        if self.global_context().ego_manual:
+                            self._add_manual_ego_camera()
+                        
+                    except Exception as e:
+                        self.gui_status_text.content = f"❌ **Error**: {str(e)}"
 
         await self.on_sample_update(None)
 
@@ -511,19 +854,55 @@ class ClientClosures:
         
         default_rotation = R.from_euler('z', 90, degrees=True).as_matrix()
         default_position = np.array([0.0, 0.0, 0.0])
+        
+        # Snap to current frame's green camera pose if available
+        current_frame = self.gui_timestep.value if self.gui_timestep is not None else 0
+        w2c_to_use = None
+        if hasattr(self, 'modified_extrinsics') and current_frame in self.modified_extrinsics:
+            w2c_to_use = self.modified_extrinsics[current_frame]
+        elif hasattr(self, 'ego_extrinsics') and self.ego_extrinsics is not None and current_frame < len(self.ego_extrinsics):
+            w2c_to_use = self.ego_extrinsics[current_frame]
+            
+        if is_valid_extrinsic(w2c_to_use):
+            try:
+                w2c_ego = np.array(w2c_to_use, dtype=np.float32)
+                w2c_4x4 = np.eye(4, dtype=np.float32)
+                w2c_4x4[:3, :] = w2c_ego
+                
+                # 90도 Roll 역변환 오프셋 적용 (Viser 화면에 똑바로 표시)
+                R_offset_inv = np.eye(4, dtype=np.float32)
+                R_offset_inv[:3, :3] = np.array([
+                    [0.0, -1.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0]
+                ], dtype=np.float32)
+                w2c_4x4 = R_offset_inv @ w2c_4x4
+                
+                c2w_ego = np.linalg.inv(w2c_4x4)
+                default_rotation = c2w_ego[:3, :3]
+                default_position = c2w_ego[:3, 3]
+            except Exception as e:
+                logger.warning(f"Failed to snap manual camera to frame {current_frame} pose: {e}")
+                
         default_quat = tf.SO3.from_matrix(default_rotation).wxyz
         
+        is_visible = True
+        if hasattr(self, 'gui_show_manual_ego') and self.gui_show_manual_ego is not None:
+            is_visible = self.gui_show_manual_ego.value
+            
         # Create transform controls
         self.manual_ego_transform_handle = self.client.scene.add_transform_controls(
             "/manual_ego_camera/controls",
             scale=0.5,
             line_width=5.0,
+            visible=is_visible,
         )
         self.manual_ego_transform_handle.wxyz = default_quat
         self.manual_ego_transform_handle.position = default_position
         
         # Create camera frustum
-        fov = np.radians(60.0)
+        fov = np.radians(80.0)
+            
         self.manual_ego_frustum = self.client.scene.add_camera_frustum(
             "/manual_ego_camera/frustum",
             fov=fov,
@@ -532,6 +911,7 @@ class ClientClosures:
             color=(255, 165, 0),
             wxyz=default_quat,
             position=default_position,
+            visible=is_visible,
         )
         
         # Create frame handle
@@ -541,6 +921,7 @@ class ClientClosures:
             position=default_position,
             axes_length=0.2,
             axes_radius=0.015,
+            visible=is_visible,
         )
         
         # Update callback for transform controls
@@ -554,21 +935,49 @@ class ClientClosures:
         logger.info("Manual ego camera added")
     
     def _reset_manual_ego_camera(self):
-        """Reset manual ego camera to default pose (90° CCW around Z)."""
+        """Reset manual ego camera to the current frame's green camera pose (or default if unavailable)."""
         if self.manual_ego_transform_handle is None:
             return
             
-        # Default pose: 90° counter-clockwise rotation around Z-axis
-        default_rotation = R.from_euler('z', 90, degrees=True).as_matrix()
-        default_position = np.array([0.0, 0.0, 0.0])
-        default_quat = tf.SO3.from_matrix(default_rotation).wxyz
+        rotation = R.from_euler('z', 90, degrees=True).as_matrix()
+        position = np.array([0.0, 0.0, 0.0])
+        
+        current_frame = self.gui_timestep.value if self.gui_timestep is not None else 0
+        w2c_to_use = None
+        if hasattr(self, 'modified_extrinsics') and current_frame in self.modified_extrinsics:
+            w2c_to_use = self.modified_extrinsics[current_frame]
+        elif hasattr(self, 'ego_extrinsics') and self.ego_extrinsics is not None and current_frame < len(self.ego_extrinsics):
+            w2c_to_use = self.ego_extrinsics[current_frame]
+            
+        if is_valid_extrinsic(w2c_to_use):
+            try:
+                w2c_ego = np.array(w2c_to_use, dtype=np.float32)
+                w2c_4x4 = np.eye(4, dtype=np.float32)
+                w2c_4x4[:3, :] = w2c_ego
+                
+                # 90도 Roll 역변환 오프셋 적용 (Viser 화면에 똑바로 표시)
+                R_offset_inv = np.eye(4, dtype=np.float32)
+                R_offset_inv[:3, :3] = np.array([
+                    [0.0, -1.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0]
+                ], dtype=np.float32)
+                w2c_4x4 = R_offset_inv @ w2c_4x4
+                
+                c2w_ego = np.linalg.inv(w2c_4x4)
+                rotation = c2w_ego[:3, :3]
+                position = c2w_ego[:3, 3]
+            except Exception as e:
+                pass
+                
+        quat = tf.SO3.from_matrix(rotation).wxyz
         
         # Update transform control
-        self.manual_ego_transform_handle.wxyz = default_quat
-        self.manual_ego_transform_handle.position = default_position
+        self.manual_ego_transform_handle.wxyz = quat
+        self.manual_ego_transform_handle.position = position
         
-        # Update will be triggered by on_update callback
-        logger.info("Manual ego camera reset to default pose")
+        self._update_manual_ego_camera()
+        logger.info("Manual ego camera reset to default/green camera pose")
     
     def _update_manual_ego_camera(self):
         """Update manual ego camera frustum and extrinsic matrix display."""
@@ -633,12 +1042,36 @@ class ClientClosures:
         
         self.client.camera.fov = np.deg2rad(self.gui_fov.value)
         self.scene_frame_handles = []
+        self.ego_frustum_handles = []
+        
+        # Try to load ego_extrinsics from meta.json
+        self.ego_extrinsics = None
+        try:
+            dataset_name = current_artifact.base_path.name
+            datasets_root = current_artifact.base_path.resolve().parents[1] / "datasets"
+            meta_json_path = datasets_root / dataset_name / "meta.json"
+            if not meta_json_path.exists():
+                meta_json_path = Path(__file__).resolve().parents[3] / "datasets" / dataset_name / "meta.json"
+                
+            if meta_json_path.exists():
+                with open(meta_json_path, "r") as f:
+                    meta_data = json.load(f)
+                if "test_datasets" in meta_data and len(meta_data["test_datasets"]) > 0:
+                    entry = meta_data["test_datasets"][0]
+                    if "ego_extrinsics" in entry:
+                        self.ego_extrinsics = entry["ego_extrinsics"]
+                        if self.global_context().frame_fix:
+                            self.ego_extrinsics = self.ego_extrinsics[:49]
+                        logger.info(f"Loaded {len(self.ego_extrinsics)} ego extrinsics from {meta_json_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load ego_extrinsics for visualization: {e}")
         
         # Mean background depth 계산 (use_mean_bg가 true이고 아직 계산되지 않은 경우)
         if use_mean_bg and (self.global_context().mean_depth is None or self.global_context().mean_rgb is None):
             logger.info("Computing mean background depth for the first time...")
+            max_frames = 49 if self.global_context().frame_fix else None
             mean_depth, mean_rgb = compute_mean_background_depth(
-                current_artifact, spatial_subsample
+                current_artifact, spatial_subsample, max_frames=max_frames
             )
             # GlobalContext에 저장
             self.global_context().mean_depth = mean_depth
@@ -670,6 +1103,8 @@ class ClientClosures:
                 none_it_mask(read_instance_artifacts(current_artifact.mask_path)),
             )
         ):
+            if self.global_context().frame_fix and frame_idx >= 49:
+                break
             if frame_idx % temporal_subsample != 0:
                 continue
 
@@ -770,6 +1205,45 @@ class ClientClosures:
                 dynamic_colors,
             )
             self.scene_frame_handles.append(frame_node)
+
+            # Render the ego camera frustum if ego_extrinsics are available
+            if self.ego_extrinsics is not None and frame_idx < len(self.ego_extrinsics):
+                try:
+                    w2c_ego = np.array(self.ego_extrinsics[frame_idx], dtype=np.float32)
+                    w2c_4x4 = np.eye(4, dtype=np.float32)
+                    w2c_4x4[:3, :] = w2c_ego
+                    
+                    # 90도 Roll 역변환 오프셋 적용 (Viser 화면에 똑바로 표시)
+                    R_offset_inv = np.eye(4, dtype=np.float32)
+                    R_offset_inv[:3, :3] = np.array([
+                        [0.0, -1.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0]
+                    ], dtype=np.float32)
+                    w2c_4x4 = R_offset_inv @ w2c_4x4
+                    
+                    c2w_ego = np.linalg.inv(w2c_4x4)
+                    
+                    is_visible = True
+                    if self.gui_show_all_frames is not None:
+                        if not self.gui_show_all_frames.value:
+                            is_visible = (frame_idx == self.gui_timestep.value if self.gui_timestep is not None else 0)
+                    else:
+                        is_visible = (frame_idx == 0)
+                        
+                    ego_frustum = self.client.scene.add_camera_frustum(
+                        f"/frames/t{frame_idx}/ego_frustum",
+                        fov=np.radians(80.0),
+                        aspect=frame_width / frame_height,
+                        scale=self.gui_frustum_size.value * 0.8,
+                        color=(50, 205, 50),  # Lime Green for ego cameras
+                        wxyz=tf.SO3.from_matrix(c2w_ego[:3, :3]).wxyz,
+                        position=c2w_ego[:3, 3],
+                        visible=is_visible,
+                    )
+                    self.ego_frustum_handles.append(ego_frustum)
+                except Exception as e:
+                    logger.warning(f"Error rendering ego frustum for frame {frame_idx}: {e}")
 
     def _make_frame_nodes(
         self,
@@ -913,6 +1387,53 @@ class ClientClosures:
                             # Show only current frame's ego frustum
                             if current_timestep < len(self.ego_frustum_handles):
                                 self.ego_frustum_handles[current_timestep].visible = True
+                                
+                    # If manual camera is active, update its pose
+                    if self.global_context().ego_manual and self.manual_ego_transform_handle is not None:
+                        # 1. 자동 진행(auto-advance) 모드인 경우: 이전 프레임의 위치를 그대로 가져감 (carry-over)
+                        if hasattr(self, '_auto_advancing') and self._auto_advancing:
+                            self.manual_ego_transform_handle.position = self._carry_over_position
+                            self.manual_ego_transform_handle.wxyz = self._carry_over_wxyz
+                            self._auto_advancing = False
+                            self._update_manual_ego_camera()
+                        else:
+                            # 2. 수동 슬라이더 이동의 경우:
+                            # 우선순위: modified_extrinsics -> ego_extrinsics 순으로 검사하여 유효한 pose가 있으면 snap
+                            w2c_to_use = None
+                            if hasattr(self, 'modified_extrinsics') and current_timestep in self.modified_extrinsics:
+                                w2c_to_use = self.modified_extrinsics[current_timestep]
+                            elif hasattr(self, 'ego_extrinsics') and self.ego_extrinsics is not None and current_timestep < len(self.ego_extrinsics):
+                                w2c_to_use = self.ego_extrinsics[current_timestep]
+                                
+                            if is_valid_extrinsic(w2c_to_use):
+                                try:
+                                    w2c_ego = np.array(w2c_to_use, dtype=np.float32)
+                                    w2c_4x4 = np.eye(4, dtype=np.float32)
+                                    w2c_4x4[:3, :] = w2c_ego
+                                    
+                                    # 90도 Roll 역변환 오프셋 적용 (Viser 화면에 똑바로 표시)
+                                    R_offset_inv = np.eye(4, dtype=np.float32)
+                                    R_offset_inv[:3, :3] = np.array([
+                                        [0.0, -1.0, 0.0],
+                                        [1.0, 0.0, 0.0],
+                                        [0.0, 0.0, 1.0]
+                                    ], dtype=np.float32)
+                                    w2c_4x4 = R_offset_inv @ w2c_4x4
+                                    
+                                    c2w_ego = np.linalg.inv(w2c_4x4)
+                                    
+                                    self.manual_ego_transform_handle.position = c2w_ego[:3, 3]
+                                    self.manual_ego_transform_handle.wxyz = tf.SO3.from_matrix(c2w_ego[:3, :3]).wxyz
+                                    self._update_manual_ego_camera()
+                                except Exception as e:
+                                    pass
+                            else:
+                                # 3. 유효한 pose가 없는 프레임으로 이동한 경우:
+                                # 이전 프레임에서 맞췄던 조절 핸들 위치를 그대로 유지(carry-over)합니다!
+                                # 원점[0,0,0]으로 가지 않고, 현재 핸들의 position과 wxyz를 변경하지 않은 채로 둡니다.
+                                # 단, visualizer 렌더링 동기화를 위해 _update_manual_ego_camera 만 호출해 줍니다.
+                                self._update_manual_ego_camera()
+                                
                 self.current_displayed_timestep = current_timestep
 
     def cleanup(self):
@@ -936,7 +1457,7 @@ def get_host_ip() -> str:
     return internal_ip
 
 
-def run_viser(base_path: Path, port: int = 20540, use_mean_bg: bool = False, ego_manual: bool = False):
+def run_viser(base_path: Path, port: int = 20540, use_mean_bg: bool = False, ego_manual: bool = False, frame_fix: bool = False):
     # Get list of artifacts.
     logger.info(f"Loading artifacts from {base_path}")
     artifacts: list[ArtifactPath] = list(ArtifactPath.glob_artifacts(base_path, use_video=True))
@@ -948,7 +1469,8 @@ def run_viser(base_path: Path, port: int = 20540, use_mean_bg: bool = False, ego
     _global_context = GlobalContext(
         artifacts=sorted(artifacts, key=lambda x: x.artifact_name),
         use_mean_bg=use_mean_bg,
-        ego_manual=ego_manual
+        ego_manual=ego_manual,
+        frame_fix=frame_fix
     )
 
     # 새 코드: 모든 인터페이스에서 수신 대기
@@ -996,9 +1518,14 @@ def main():
         action="store_true",
         help="Enable manual ego camera control with transform handles"
     )
+    parser.add_argument(
+        "--frame_fix",
+        action="store_true",
+        help="Fix the number of frames to 49"
+    )
     args = parser.parse_args()
 
-    run_viser(args.base_path, args.port, args.use_mean_bg, args.ego_manual)
+    run_viser(args.base_path, args.port, args.use_mean_bg, args.ego_manual, args.frame_fix)
 
 
 if __name__ == "__main__":

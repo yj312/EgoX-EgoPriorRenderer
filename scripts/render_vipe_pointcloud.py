@@ -124,6 +124,38 @@ def scale_intrinsics(*args):
     else:
         return new_fx, new_cx, new_cy
 
+
+def apply_ego_intrinsics_override(
+        ego_intrinsic: np.ndarray,
+        focal_length: Optional[float] = None,
+        principal_x: Optional[float] = None,
+        principal_y: Optional[float] = None,
+    ) -> np.ndarray:
+    """Apply an output-resolution renderer K without changing meta/GGA K."""
+    matrix = np.asarray(ego_intrinsic, dtype=np.float32).copy()
+    overrides = (focal_length, principal_x, principal_y)
+    if all(value is None for value in overrides):
+        return matrix
+    if any(value is None for value in overrides):
+        raise ValueError(
+            "renderer ego intrinsics override requires focal length, principal x, "
+            "and principal y together"
+        )
+    if not np.isfinite(overrides).all() or float(focal_length) <= 0.0:
+        raise ValueError("renderer ego intrinsics override must be finite with positive focal length")
+    matrix[0, 0] = float(focal_length)
+    matrix[1, 1] = float(focal_length)
+    matrix[0, 2] = float(principal_x)
+    matrix[1, 2] = float(principal_y)
+    matrix[0, 1] = matrix[1, 0] = 0.0
+    matrix[2] = [0.0, 0.0, 1.0]
+    logger.info(
+        "Using output-resolution renderer intrinsics override: "
+        f"f={focal_length:.3f}, cx={principal_x:.3f}, cy={principal_y:.3f}"
+    )
+    return matrix
+
+
 def load_aria_distortion_coeffs(
         online_calibration_path: Optional[str] = None,
         frame_idx: int = 0
@@ -266,7 +298,7 @@ def load_camera_params_from_meta(meta_json_path: str, input_dir: str) -> Tuple[n
         # Check if parent directory name matches video_name
         # e.g., './example/in_the_wild/videos/joker/exo.mp4' -> parent = 'joker'
         exo_parent = Path(exo_path).parent.name
-        if exo_parent == video_name:
+        if exo_parent == video_name or video_name in Path(exo_path).parts:
             matching_sample = sample
             logger.info(f"Found matching sample: exo_path='{exo_path}'")
             break
@@ -316,6 +348,8 @@ def build_background_pointcloud(
         input_dir: Path to ViPE inference results
         T_cam_to_world: 4x4 transformation matrix from camera to world coordinates
         spatial_subsample: Spatial subsampling factor for point cloud
+        start_frame: Starting frame index (optional)
+        end_frame: Ending frame index (optional, inclusive)
     
     Returns:
         global_points: Nx3 array of 3D points in world coordinates
@@ -349,7 +383,7 @@ def build_background_pointcloud(
             while True:
                 yield None, None
 
-    logger.info("Building background point cloud from all frames using depth...")
+    logger.info("Building background point cloud using depth...")
 
     rays = None
     frame_count = 0
@@ -364,6 +398,12 @@ def build_background_pointcloud(
             none_it_mask(read_instance_artifacts(artifact_path.mask_path)),
         )
     ):
+        if start_frame is not None and frame_idx < start_frame:
+            continue
+        if end_frame is not None and frame_idx > end_frame:
+            logger.info(f"Reached end_frame ({end_frame}). Stopping background point collection.")
+            break
+
         if depth is None:
             continue
 
@@ -478,15 +518,19 @@ def build_mean_background_pointcloud(
         input_dir: str,
         T_cam_to_world: np.ndarray,
         spatial_subsample: int = 2,
+        start_frame: int = None,
+        end_frame: int = None,
         max_frames: int = None
-    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
     """
-    Build a static background point cloud using nanmean.
+    Build a static background point cloud using nanmean via memory-efficient online accumulation.
     
     Args:
         input_dir: Directory containing ViPE artifacts
         T_cam_to_world: 4x4 transformation matrix from camera to world coordinates
         spatial_subsample: Spatial subsampling factor for point cloud
+        start_frame: Starting frame index (optional)
+        end_frame: Ending frame index (optional, inclusive)
         max_frames: Maximum number of frames to process (None for all)
 
     Returns:
@@ -499,10 +543,8 @@ def build_mean_background_pointcloud(
         raise ValueError(f"No ViPE artifacts found in {input_dir}")
     artifact_path = artifacts[0]
 
-    # 최적화: 모든 유효한 프레임을 스택으로 수집
-    valid_depth_frames = []
-    valid_rgb_frames = []
-    image_size = None
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
 
     def none_it(inner_it):
         try:
@@ -512,11 +554,13 @@ def build_mean_background_pointcloud(
             while True:
                 yield None, None
 
-    logger.info("Collecting valid background frames for GPU-optimized batch processing...")
+    logger.info("Collecting background frames for memory-efficient GPU accumulation...")
 
-    # GPU 최적화: 모든 데이터를 GPU에서 처리하도록 device 설정
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    sum_depth = None
+    count_depth = None
+    sum_rgb = None
+    count_rgb = None
+    image_size = None
 
     frame_count = 0
     for frame_idx, ((_, rgb), (_, depth), (_, instance_mask)) in enumerate(
@@ -526,6 +570,12 @@ def build_mean_background_pointcloud(
             none_it(read_instance_artifacts(artifact_path.mask_path)),
         )
     ):
+        if start_frame is not None and frame_idx < start_frame:
+            continue
+        if end_frame is not None and frame_idx > end_frame:
+            logger.info(f"Reached end_frame ({end_frame}). Stopping background frame collection.")
+            break
+
         if depth is None:
             continue
         
@@ -535,52 +585,43 @@ def build_mean_background_pointcloud(
 
         if image_size is None:
             image_size = rgb.shape[:2]
+            sum_depth = torch.zeros(image_size, dtype=torch.float32, device=device)
+            count_depth = torch.zeros(image_size, dtype=torch.float32, device=device)
+            sum_rgb = torch.zeros((*image_size, 3), dtype=torch.float32, device=device)
+            count_rgb = torch.zeros((*image_size, 3), dtype=torch.float32, device=device)
 
-        # GPU 최적화: 모든 텐서를 GPU로 이동
-        rgb = rgb.to(device)
-        depth = depth.to(device)
+        rgb_dev = rgb.to(device)
+        depth_dev = depth.to(device)
         if instance_mask is not None:
-            instance_mask = instance_mask.to(device)
-
-        # Keep only background (instance_id == 0)
-        # 기존 build_background_pointcloud와 동일한 로직 사용
-        if instance_mask is not None:
-            # 기존 방식: 프레임별로 background만 유지하지만 전체적으로 관대하게 처리
-            static_mask = (instance_mask == 0)
+            instance_mask_dev = instance_mask.to(device)
+            static_mask = (instance_mask_dev == 0)
         else:
-            # instance mask가 없으면 모든 픽셀을 유효하게 간주 (기존 방식과 동일)
-            static_mask = torch.ones_like(depth, dtype=torch.bool, device=device)
+            static_mask = torch.ones_like(depth_dev, dtype=torch.bool, device=device)
         
-        # Mask out invalid depth values
-        depth_mask = reliable_depth_mask_range(depth)
+        depth_mask = reliable_depth_mask_range(depth_dev)
         final_mask = static_mask & depth_mask
 
-        # GPU 최적화: 무효한 픽셀을 NaN으로 설정하여 GPU에서 처리
-        masked_depth = depth.clone().float()
-        masked_depth[~final_mask] = float('nan')
-        
-        masked_rgb = rgb.clone().float()
-        masked_rgb[~final_mask.unsqueeze(-1).expand_as(rgb)] = float('nan')
+        final_mask_float = final_mask.float()
+        final_mask_rgb_float = final_mask.unsqueeze(-1).expand_as(rgb_dev).float()
 
-        valid_depth_frames.append(masked_depth)
-        valid_rgb_frames.append(masked_rgb)
+        sum_depth += torch.nan_to_num(depth_dev, nan=0.0) * final_mask_float
+        count_depth += final_mask_float
+
+        sum_rgb += torch.nan_to_num(rgb_dev, nan=0.0) * final_mask_rgb_float
+        count_rgb += final_mask_rgb_float
         
         frame_count += 1
-        if frame_idx % 10 == 0:  # 로그 빈도 감소
-            logger.info(f"Collected frame {frame_idx} for GPU batch processing.")
+        if frame_idx % 10 == 0:
+            logger.info(f"Processed frame {frame_idx} for background accumulation.")
 
-    if not valid_depth_frames:
+    if frame_count == 0 or sum_depth is None:
         logger.warning("No valid background frames found.")
         return np.empty((0, 3)), np.empty((0, 3)), image_size
 
-    # nanmean으로 대표값 계산
-    logger.info(f"Computing nanmean across {len(valid_depth_frames)} frames...")
-    
-    stacked_depth = torch.stack(valid_depth_frames, dim=0)  # Shape: [N_frames, H, W]
-    stacked_rgb = torch.stack(valid_rgb_frames, dim=0)      # Shape: [N_frames, H, W, 3]
-    
-    # nanmean 계산 (GPU 벡터화)
-    mean_depth, mean_rgb = compute_robust_mean_tensors(stacked_depth, stacked_rgb)
+    # nanmean 계산 (온라인 누적 평균)
+    logger.info(f"Computing mean background across {frame_count} frames...")
+    mean_depth = sum_depth / count_depth.clamp(min=1.0)
+    mean_rgb = sum_rgb / count_rgb.clamp(min=1.0)
     valid_pixel_mask = mean_depth > 0
 
     # --- GPU 최적화된 포인트 클라우드 프로젝션 ---
@@ -1109,7 +1150,8 @@ def project_points_to_image_sequential(bg_points_3d: np.ndarray, bg_colors: np.n
                                       original_image_size: Optional[Tuple[int, int]] = None,
                                       artifact_path: Optional[ArtifactPath] = None,
                                       T_cam_to_world: Optional[np.ndarray] = None,
-                                      only_bg: bool = False) -> List[np.ndarray]:
+                                      only_bg: bool = False,
+                                      spatial_subsample: int = 2) -> List[np.ndarray]:
     """
     Project 3D points to 2D images using ego camera poses with individual rendering.
     
@@ -1179,7 +1221,7 @@ def project_points_to_image_sequential(bg_points_3d: np.ndarray, bg_colors: np.n
         # Build dynamic points for this frame if artifact_path is provided
         # If only_bg is True, skip building dynamic points to speed up rendering
         if (not only_bg) and artifact_path is not None and T_cam_to_world is not None:
-            dyn_points, dyn_colors = build_dynamic_points_for_frame(artifact_path, frame_idx, T_cam_to_world)
+            dyn_points, dyn_colors = build_dynamic_points_for_frame(artifact_path, frame_idx, T_cam_to_world, spatial_subsample=spatial_subsample)
         else:
             dyn_points, dyn_colors = np.empty((0, 3)), np.empty((0, 3))
 
@@ -1249,6 +1291,10 @@ def get_parser():
     parser.add_argument("--use_mean_bg", action="store_true", help="Use nanmean background instead of standard background")
     parser.add_argument("--fish_eye_rendering", action="store_true", help="Enable fish-eye rendering with 360-degree view")
     parser.add_argument("--online_calibration_path", type=str, default=None, help="(Optional) Path to online_calibration.jsonl file for real Aria distortion coefficients. If not provided, uses default Ego-Exo4D fisheye distortion coefficients.")
+    parser.add_argument("--ego_focal_length_override", type=float, default=None, help="Renderer-only focal length already expressed at output resolution")
+    parser.add_argument("--ego_principal_x_override", type=float, default=None, help="Renderer-only principal x already expressed at output resolution")
+    parser.add_argument("--ego_principal_y_override", type=float, default=None, help="Renderer-only principal y already expressed at output resolution")
+    parser.add_argument("--spatial_subsample", type=int, default=2, help="Spatial subsampling factor for point cloud density (default: 2, set 1 for maximum density)")
 
     return parser
 
@@ -1331,12 +1377,12 @@ def validate_frame_range(args, total_frames_available: int, input_dir: str):
     if args.end_frame <= args.start_frame:
         raise ValueError(f"end_frame ({args.end_frame}) must be greater than start_frame ({args.start_frame})")
     
-    # Check exact match with inference range
-    if args.start_frame != inference_start:
-        raise ValueError(f"start_frame ({args.start_frame}) must match inference range start ({inference_start})")
+    # Check that requested range is within inference range
+    if args.start_frame < inference_start:
+        raise ValueError(f"start_frame ({args.start_frame}) cannot be less than inference range start ({inference_start})")
     
-    if args.end_frame != inference_end:
-        raise ValueError(f"end_frame ({args.end_frame}) must match inference range end ({inference_end})")
+    if args.end_frame > inference_end:
+        raise ValueError(f"end_frame ({args.end_frame}) cannot exceed inference range end ({inference_end})")
     
     if args.start_frame >= total_frames_available:
         raise ValueError(f"start_frame ({args.start_frame}) exceeds available frames ({total_frames_available})")
@@ -1363,20 +1409,40 @@ def main():
     exo_intrinsic, exo_extrinsic, ego_intrinsic, ego_extrinsics_list = load_camera_params_from_meta(
         args.meta_json_path, args.input_dir
     )
+    override_requested = any(
+        value is not None
+        for value in (
+            args.ego_focal_length_override,
+            args.ego_principal_x_override,
+            args.ego_principal_y_override,
+        )
+    )
+    if args.online_calibration_path is not None and override_requested:
+        raise ValueError(
+            "renderer ego intrinsics override cannot be combined with online calibration"
+        )
+    ego_intrinsic = apply_ego_intrinsics_override(
+        ego_intrinsic,
+        focal_length=args.ego_focal_length_override,
+        principal_x=args.ego_principal_x_override,
+        principal_y=args.ego_principal_y_override,
+    )
     
     # Convert exo_extrinsic (4x4 world to cam) to T_cam_to_world (4x4 cam to world)
     T_cam_to_world = np.linalg.inv(exo_extrinsic)
     
     # Choose background building method based on use_mean_bg flag
     if getattr(args, 'use_mean_bg', False):
-        logger.info(f"Building NANMEAN background point cloud from {args.input_dir}")
+        logger.info(f"Building NANMEAN background point cloud from {args.input_dir} (frames {args.start_frame}-{args.end_frame})")
         global_points_bg, global_colors_bg, image_size = build_mean_background_pointcloud(
-            args.input_dir, T_cam_to_world
+            args.input_dir, T_cam_to_world, spatial_subsample=args.spatial_subsample,
+            start_frame=args.start_frame, end_frame=args.end_frame
         )
     else:
-        logger.info(f"Building standard background point cloud from {args.input_dir}")
+        logger.info(f"Building standard background point cloud from {args.input_dir} (frames {args.start_frame}-{args.end_frame})")
         global_points_bg, global_colors_bg, image_size = build_background_pointcloud(
-            args.input_dir, T_cam_to_world
+            args.input_dir, T_cam_to_world, spatial_subsample=args.spatial_subsample,
+            start_frame=args.start_frame, end_frame=args.end_frame
         )
     
     if len(global_points_bg) == 0:
@@ -1425,7 +1491,8 @@ def main():
         original_image_size=(2880, 2880), # Ego-Exo4D Ego view resolution
         artifact_path=artifact_path,
         T_cam_to_world=T_cam_to_world,
-        only_bg=args.only_bg
+        only_bg=args.only_bg,
+        spatial_subsample=args.spatial_subsample
     )
 
     # Save images returned by the renderer as MP4 video

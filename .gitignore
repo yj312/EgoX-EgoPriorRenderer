@@ -182,3 +182,24 @@ inthewild_dataset/
 
 scripts/vis_cam.py
 .READ/
+
+# 대상 경로와 상위 폴더를 포함
+!/example/
+!/example/in_the_wild/
+!/example/in_the_wild/videos/
+
+# videos 내부 전체 포함
+!/example/in_the_wild/videos/**
+
+# 단, 폴더 이름에 body가 포함된 폴더와 그 내용 제외
+/example/in_the_wild/videos/**/*[bB][oO][dD][yY]*/
+
+# 대용량 데이터 제외
+/data_preprocess/egoexo4d_v1/
+
+# 실행 결과 제외
+/vipe_results/
+
+# 전처리 데이터 폴더 내부 전체 포함
+!/data_preprocess/data/
+!/data_preprocess/data/**

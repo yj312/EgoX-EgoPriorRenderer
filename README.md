@@ -4,6 +4,21 @@
 
 `ViPE` provides point cloud rendering functionality to visualize the 3D reconstruction results. This is particularly useful for analyzing the spatial structure and quality of the estimated depth maps and camera poses.
 
+## Conda 환경 설치
+
+EgoX-EgoPriorRenderer 폴더에서 실행합니다.
+
+```bash
+conda create -n egox-egoprior python=3.10 -y
+conda activate egox-egoprior
+
+python -m pip install torch==2.7.0 torchvision==0.22.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+
+python -m pip install -r requirements.txt --no-build-isolation
+python -m pip install --no-build-isolation -e .
+```
+
 ## 👀 Installation
 
 To ensure the reproducibility, we recommend creating the runtime environment using [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/getting-started.html).

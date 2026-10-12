@@ -8,11 +8,12 @@
 # REPO_ROOT: Root directory of the repository (auto-detected if not set)
 # WORKING_DIR: Output directory (relative to REPO_ROOT or absolute path)
 # DATA_DIR: Input data directory (relative to REPO_ROOT or absolute path)
-WORKING_DIR="data_preprocess"  # Output directory
-DATA_DIR="data_preprocess/example"  # Input data directory (read-only)
+# 이 부분 수정하면 됨!!!! 데이터 directory 
+WORKING_DIR="/mnt/i2slab_data2/EgoExo4D_preprocessed"  # Output directory
+DATA_DIR="/mnt/i2slab_data2/EgoExo4D"  # Input data directory (read-only)
 
 # Dataset
-EGO4D_DATASET_TYPE="test"  # Dataset type: "test", "train", or "val"
+EGO4D_DATASET_TYPE="train"  # Dataset type: "test", "train", or "val"
 
 # Frame range
 START_FRAME=0
@@ -22,8 +23,12 @@ START_FRAME=0
 # Rendering
 POINT_SIZE="5.0"
 
-# Multiprocessing
-BATCH_SIZE=3  # Number of parallel processes (recommended: 6-8)
+# Multiprocssing
+BATCH_SIZE=8  # Number of parallel processes (recommended: 6-8)
+
+# GPU
+# [NEW] GPU 2번 고정 (CUDA_VISIBLE_DEVICES)
+export CUDA_VISIBLE_DEVICES=2
 
 # GT Intrinsic
 USE_GT_INTRINSIC=true  # Use ground-truth camera intrinsics from ego_pose annotations

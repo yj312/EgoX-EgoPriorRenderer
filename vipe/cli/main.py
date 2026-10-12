@@ -142,8 +142,9 @@ def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: 
 @click.option("--port", "-p", default=20540, type=int, help="Port for the visualization server (default: 20540)")
 @click.option("--use_mean_bg", is_flag=True, help="Use robust statistical mean background instead of standard background")
 @click.option("--ego_manual", is_flag=True, help="Enable manual ego camera control with transform handles")
-def visualize(data_path: Path, port: int, use_mean_bg: bool, ego_manual: bool):
-    run_viser(data_path, port, use_mean_bg, ego_manual)
+@click.option("--frame_fix", is_flag=True, help="Fix the number of frames to 49")
+def visualize(data_path: Path, port: int, use_mean_bg: bool, ego_manual: bool, frame_fix: bool):
+    run_viser(data_path, port, use_mean_bg, ego_manual, frame_fix)
 
 
 @click.group()

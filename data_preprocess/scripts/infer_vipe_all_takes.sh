@@ -40,7 +40,10 @@ fi
 
 TAKES_DIR="${DATA_DIR}/takes"
 CAPTURES_FILE="${DATA_DIR}/captures.json"
-EGO_POSE_DIR="${DATA_DIR}/annotations/ego_pose/test/camera_pose"
+# [ORIGINAL] 'test' 하드코딩 (주석 처리: EGO4D_DATASET_TYPE 변수 사용)
+# EGO_POSE_DIR="${DATA_DIR}/annotations/ego_pose/test/camera_pose"
+# [NEW] config.sh의 EGO4D_DATASET_TYPE에 따라 동적 결정
+EGO_POSE_DIR="${DATA_DIR}/annotations/ego_pose/${EGO4D_DATASET_TYPE}/camera_pose"
 
 BASE_PATH="${TAKES_DIR}"
 DATA_ROOT="${WORKING_DIR}/data/${START_FRAME}_${END_FRAME}"
@@ -486,7 +489,13 @@ process_single_take() {
                     echo "[BATCH-$batch_id] [GT][WARN] ffmpeg not found; skipping EXO GT extraction"
                 fi
                 
-                ego_video_path="${BASE_PATH}/${take_name}/frame_aligned_videos/downscaled/448/aria01_214-1.mp4"
+                ego_video_path=""
+                for f in "${BASE_PATH}/${take_name}/frame_aligned_videos/downscaled/448"/aria*_214-1.mp4; do
+                    if [[ -f "$f" ]]; then
+                        ego_video_path="$f"
+                        break
+                    fi
+                done
                 if [[ -f "$ego_video_path" ]]; then
                     if command -v ffmpeg >/dev/null 2>&1; then
                         echo "[BATCH-$batch_id] [GT] Extracting EGO GT frames from $ego_video_path -> $ego_gt_dir (start=$START_FRAME, count=$frames_to_extract)"
@@ -496,7 +505,7 @@ process_single_take() {
                         echo "[BATCH-$batch_id] [GT][WARN] ffmpeg not found; skipping EGO GT extraction"
                     fi
                 else
-                    echo "[BATCH-$batch_id] [GT][WARN] Ego GT video not found: $ego_video_path"
+                    echo "[BATCH-$batch_id] [GT][WARN] Ego GT video not found in ${BASE_PATH}/${take_name}/frame_aligned_videos/downscaled/448/ matching aria*_214-1.mp4"
                 fi
 
                 if [[ -d "$OUTPUT_DIR/${take_name}" ]]; then
@@ -850,7 +859,10 @@ run_render() {
     fi
     
     local input_dir="${VIPE_RESULTS_ROOT}/${take_name}/${result_subdir}"
-    local ego_camera_pose_path="${DATA_DIR}/annotations/ego_pose/test/camera_pose/${ego_uuid}.json"
+    # [ORIGINAL] 'test' 하드코딩 (주석 처리)
+    # local ego_camera_pose_path="${DATA_DIR}/annotations/ego_pose/test/camera_pose/${ego_uuid}.json"
+    # [NEW] EGO4D_DATASET_TYPE 변수 사용
+    local ego_camera_pose_path="${DATA_DIR}/annotations/ego_pose/${EGO4D_DATASET_TYPE}/camera_pose/${ego_uuid}.json"
     local online_calibration_path="${DATA_DIR}/takes/${take_name}/trajectory/online_calibration.jsonl"
     
     local meta_json_path="${META_FILES_DIR}/meta_${take_name}_${result_subdir}.json"
@@ -1105,7 +1117,10 @@ run_inference() {
     # Extract GT intrinsics from ego_pose if USE_GT_INTRINSIC=true
     local gt_intrinsic_arg=""
     if [[ -n "${USE_GT_INTRINSIC:-}" ]] && [[ "$USE_GT_INTRINSIC" == "true" ]]; then
-        local ego_pose_file="${DATA_DIR}/annotations/ego_pose/test/camera_pose/${uuid}.json"
+        # [ORIGINAL] 'test' 하드코딩 (주석 처리)
+        # local ego_pose_file="${DATA_DIR}/annotations/ego_pose/test/camera_pose/${uuid}.json"
+        # [NEW] EGO4D_DATASET_TYPE 변수 사용
+        local ego_pose_file="${DATA_DIR}/annotations/ego_pose/${EGO4D_DATASET_TYPE}/camera_pose/${uuid}.json"
         if [[ -f "$ego_pose_file" ]]; then
             gt_intrinsic_arg=$(python3 -c "
 import json, sys
@@ -1266,18 +1281,12 @@ main() {
     local remaining_takes_to_process=()
     local start_index=0
     
+    # We always start from index 0 to check all takes and skip completed ones individually
+    start_index=0
     if [[ -n "$last_completed_take" ]]; then
-        echo "📋 Last completed take: $last_completed_take"
-        for i in "${!takes_names[@]}"; do
-            if [[ "${takes_names[$i]}" == "$last_completed_take" ]]; then
-                start_index=$((i + 1))
-                break
-            fi
-        done
-        echo "🚀 Starting from index: $start_index"
-    else
-        echo "📋 No completed takes found, starting from beginning"
+        echo "📋 Last completed take (in order): $last_completed_take"
     fi
+    echo "📋 Checking all takes from the beginning (completed takes will be skipped automatically)"
     
     for ((i=start_index; i<${#takes_to_process[@]}; i++)); do
         remaining_takes_to_process+=("${takes_to_process[$i]}")
