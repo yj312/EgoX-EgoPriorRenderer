@@ -9,26 +9,24 @@
 # WORKING_DIR: Output directory (relative to REPO_ROOT or absolute path)
 # DATA_DIR: Input data directory (relative to REPO_ROOT or absolute path)
 # 이 부분 수정하면 됨!!!! 데이터 directory 
-WORKING_DIR="/mnt/i2slab_data2/EgoExo4D_preprocessed"  # Output directory
-DATA_DIR="/mnt/i2slab_data2/EgoExo4D"  # Input data directory (read-only)
+WORKING_DIR="data_preprocess"  # Output directory
+DATA_DIR="/mnt/nas/i2slab_shared/HRI_EgoX/EgoExo4D"  # Input data directory (read-only)
 
-# Dataset
-EGO4D_DATASET_TYPE="train"  # Dataset type: "test", "train", or "val"
+# Single target take (leave empty to process all takes in DATA_DIR/takes)
+TARGET_TAKE="cmu_bike01_2"
 
-# Frame range
-START_FRAME=0
-# END_FRAME=$((START_FRAME + 49 - 1))  # Auto-calculated if not set
-# Or set directly: END_FRAME=925
+# Dataset split for annotations ('train', 'val', or 'test')
+EGO4D_DATASET_TYPE="train"  # cmu_bike01_2 is in train split
+
+# Frame range (cmu_bike01_2 has ego-pose annotation at 877~925 for 49 frames)
+START_FRAME=877
+END_FRAME=925
 
 # Rendering
 POINT_SIZE="5.0"
 
-# Multiprocssing
-BATCH_SIZE=8  # Number of parallel processes (recommended: 6-8)
-
-# GPU
-# [NEW] GPU 2번 고정 (CUDA_VISIBLE_DEVICES)
-export CUDA_VISIBLE_DEVICES=2
+# Multiprocessing
+BATCH_SIZE=3  # Number of parallel processes (recommended: 6-8)
 
 # GT Intrinsic
 USE_GT_INTRINSIC=true  # Use ground-truth camera intrinsics from ego_pose annotations

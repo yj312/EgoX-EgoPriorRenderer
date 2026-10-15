@@ -45,6 +45,24 @@ Before running the rendering commands, ensure you have completed the ViPE infere
 ./scripts/infer_vipe.sh
 ```
 
+Choose the depth/pose extraction range with the wrapper's `--frame` option:
+
+```bash
+# First 49 frames (indices 0-48)
+bash scripts/infer_vipe.sh /path/to/exo.mp4 --frame 49
+
+# Entire input video; this is also the default when --frame is omitted
+bash scripts/infer_vipe.sh /path/to/exo.mp4 --frame all
+
+# Existing numeric egobody input is supported
+bash scripts/infer_vipe.sh 4 --frame 49
+```
+
+`--frame` accepts `49` or `all`. Inputs shorter than 49 frames use the available
+frames. This controls ViPE depth/pose generation; `scripts/render_vipe.sh` has its
+own rendering range, currently 0-48. Depth artifacts are saved as zipped EXR files;
+use `scripts/convert_depth_zip_to_npy.py` to convert them to NPY for EgoX inference.
+
 ### ViPE Inference Arguments
 
 The scripts run ViPE inference with various parameters. Below are the key CLI arguments used:

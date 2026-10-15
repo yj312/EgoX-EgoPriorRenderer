@@ -15,7 +15,7 @@ set -euo pipefail
 # Configurations (Modify as needed)
 # ----------------------------------------------------------------------------
 # Name of the dataset folder created in EgoX/datasets/
-export EGOX_DATASET_NAME="egoexo4d_train1"
+export EGOX_DATASET_NAME="egoexo4d_test1"
 
 # Conda installation path
 CONDA_PROFILE_PATH="/home/i2slab4/miniconda3/etc/profile.d/conda.sh"
@@ -60,12 +60,8 @@ echo "==========================================================================
 python3 data_preprocess/scripts/compile_meta.py
 
 # Create target meta.json for EgoX model inference from the compiled meta
-# [ORIGINAL] EgoX/datasets/ 기준 경로 (주석 처리: home 파티션 용량 부족 우려)
-# compiled_json="../datasets/${EGOX_DATASET_NAME}/meta_compiled.json"
-# target_json="../datasets/${EGOX_DATASET_NAME}/meta.json"
-# [NEW] /mnt 파티션 기준 경로
-compiled_json="/mnt/i2slab_data2/EgoExo4D_preprocessed/${EGOX_DATASET_NAME}/meta_compiled.json"
-target_json="/mnt/i2slab_data2/EgoExo4D_preprocessed/${EGOX_DATASET_NAME}/meta.json"
+compiled_json="../datasets/${EGOX_DATASET_NAME}/meta_compiled.json"
+target_json="../datasets/${EGOX_DATASET_NAME}/meta.json"
 
 if [[ -f "$compiled_json" ]]; then
     cp "$compiled_json" "$target_json"
@@ -95,4 +91,4 @@ python3 data_preprocess/scripts/stitch_frames.py
 
 echo ""
 echo "🎉 [Pipeline Complete] All preprocessing steps completed successfully!"
-echo "📍 Final dataset output: /mnt/i2slab_data2/EgoExo4D_preprocessed/${EGOX_DATASET_NAME}/"
+echo "📍 Final dataset output: ../datasets/${EGOX_DATASET_NAME}/"
